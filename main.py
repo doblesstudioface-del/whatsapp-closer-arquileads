@@ -46,7 +46,8 @@ def enviar_mensaje(number, text):
         "type": "text",
         "text": {"body": text}
     }
-    requests.post(url, json=payload, headers=headers)
+    response = requests.post(url, json=payload, headers=headers)
+    print(f"Respuesta de Meta: {response.status_code} - {response.text}") # ESTO NOS DIRA EL ERROR REAL
 
 if __name__ == "__main__":
     app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 10000)))
