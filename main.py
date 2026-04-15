@@ -38,7 +38,7 @@ def webhook():
     return "EVENT_RECEIVED", 200
 
 def enviar_mensaje(number, text):
-    url = f"https://graph.facebook.com/v18.0/{PHONE_NUMBER_ID}/messages"
+    url = f"https://graph.facebook.com/v25.0/{PHONE_NUMBER_ID}/messages"
     headers = {"Authorization": f"Bearer {ACCESS_TOKEN}", "Content-Type": "application/json"}
     payload = {
         "messaging_product": "whatsapp",
