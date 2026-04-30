@@ -1,7 +1,10 @@
 from flask import Flask, request
 import requests
 import os
+import re
 from datetime import datetime
+from bs4 import BeautifulSoup
+from urllib.parse import urlparse
 
 app = Flask(__name__)
 
@@ -21,6 +24,10 @@ PALABRAS_LEAD_CALIENTE = [
     "cuanto", "cuánto", "contratar", "empezar", "esta semana", "este mes", "urgente"
 ]
 
+URL_REGEX = re.compile(r"https?://[^\s]+|www\.[^\s]+", re.IGNORECASE)
+CTA_KEYWORDS = ["contacto", "contactar", "agenda", "agendar", "cotiza", "cotizar", "whatsapp", "llamada", "consulta", "proyecto"]
+ARCHITECTURE_KEYWORDS = ["arquitectura", "arquitecto", "arquitectos", "estudio", "interiorismo", "diseño interior", "proyectos", "residencial"]
+
 
 def ahora_iso():
     return datetime.utcnow().isoformat()
@@ -28,6 +35,16 @@ def ahora_iso():
 
 def normalizar_texto(texto):
     return (texto or "").strip().lower()
+
+
+def extraer_url(texto):
+    match = URL_REGEX.search(texto or "")
+    if not match:
+        return None
+    url = match.group(0).strip().rstrip(".,);]")
+    if url.startswith("www."):
+        url = "https://" + url
+    return url
 
 
 def obtener_estado(number):
@@ -46,6 +63,8 @@ def crear_estado(number):
         "quiere_oportunidades": None,
         "problema_detectado": None,
         "presupuesto": None,
+        "url_web": None,
+        "diagnostico_web": None,
         "lead_caliente": False,
         "alerta_enviada": False,
         "guardado_en_sheets": False,
@@ -89,9 +108,121 @@ def respuesta_precio():
     )
 
 
+def analizar_web(url):
+    try:
+        parsed = urlparse(url)
+        if parsed.scheme not in ["http", "https"] or not parsed.netloc:
+            return "No pude leer ese enlace. Envíame una URL completa, por ejemplo: https://tusitio.com"
+
+        headers = {
+            "User-Agent": "Mozilla/5.0 (compatible; ArquileadsBot/1.0; +https://example.com/bot)"
+        }
+        response = requests.get(url, headers=headers, timeout=12, allow_redirects=True)
+        status = response.status_code
+
+        if status >= 400:
+            return (
+                "Intenté revisar la web, pero respondió con un error.\n\n"
+                f"Código detectado: {status}.\n\n"
+                "Esto ya es una señal importante: si el sitio no carga de forma estable, puede afectar la confianza y la conversión."
+            )
+
+        soup = BeautifulSoup(response.text, "html.parser")
+        for tag in soup(["script", "style", "noscript"]):
+            tag.decompose()
+
+        title = (soup.title.string.strip() if soup.title and soup.title.string else "")
+        meta_description_tag = soup.find("meta", attrs={"name": "description"})
+        meta_description = meta_description_tag.get("content", "").strip() if meta_description_tag else ""
+        h1 = soup.find("h1")
+        h1_text = h1.get_text(" ", strip=True) if h1 else ""
+        body_text = soup.get_text(" ", strip=True).lower()
+        links_text = " ".join(a.get_text(" ", strip=True).lower() for a in soup.find_all("a"))
+        hrefs = " ".join(a.get("href", "").lower() for a in soup.find_all("a"))
+
+        tiene_cta = any(keyword in links_text or keyword in body_text for keyword in CTA_KEYWORDS)
+        tiene_whatsapp = "wa.me" in hrefs or "whatsapp" in hrefs or "whatsapp" in body_text
+        parece_arquitectura = any(keyword in body_text for keyword in ARCHITECTURE_KEYWORDS)
+
+        hallazgos = []
+        mejoras = []
+
+        if title:
+            hallazgos.append("La web tiene título definido.")
+        else:
+            mejoras.append("Falta un título claro para la página.")
+
+        if meta_description:
+            hallazgos.append("Tiene descripción para buscadores.")
+        else:
+            mejoras.append("No encontré una meta descripción clara; eso puede afectar cómo se entiende la web en Google.")
+
+        if h1_text:
+            if len(h1_text) < 35:
+                mejoras.append("El mensaje principal parece corto; conviene explicar mejor qué hace el estudio y para quién.")
+            else:
+                hallazgos.append("Tiene un mensaje principal visible.")
+        else:
+            mejoras.append("No encontré un H1 claro; el primer mensaje debería explicar rápido el valor del estudio.")
+
+        if tiene_cta:
+            hallazgos.append("Tiene alguna llamada a la acción.")
+        else:
+            mejoras.append("No detecté una llamada clara a contacto, agenda o cotización.")
+
+        if tiene_whatsapp:
+            hallazgos.append("Hay señal de contacto por WhatsApp.")
+        else:
+            mejoras.append("No detecté un acceso claro a WhatsApp; para conversión suele ser clave.")
+
+        if not parece_arquitectura:
+            mejoras.append("No queda suficientemente claro, desde el texto inicial, que sea una web enfocada en arquitectura/interiorismo.")
+
+        if not mejoras:
+            mejoras.append("La base parece correcta. El siguiente paso sería revisar si el mensaje realmente diferencia al estudio y guía al visitante hacia contacto.")
+
+        diagnostico = (
+            "Revisé la web de forma automática.\n\n"
+            "Primer diagnóstico:\n"
+            f"• {mejoras[0]}\n"
+        )
+
+        if len(mejoras) > 1:
+            diagnostico += f"• {mejoras[1]}\n"
+        if hallazgos:
+            diagnostico += f"\nAlgo positivo: {hallazgos[0]}\n"
+
+        diagnostico += (
+            "\nMi lectura: puede haber oportunidad de mejorar claridad, estructura y conversión, no solo diseño visual.\n\n"
+            "Para afinar el diagnóstico: ¿qué tipo de proyectos quiere atraer tu estudio?"
+        )
+        return diagnostico
+
+    except requests.RequestException:
+        return (
+            "Intenté revisar la web, pero no pude cargarla correctamente.\n\n"
+            "Puede ser un bloqueo del servidor, un problema temporal o una URL incompleta. Envíame el enlace completo y lo revisamos de nuevo."
+        )
+    except Exception as e:
+        print(f"Error analizando web: {e}")
+        return (
+            "Pude recibir el enlace, pero no logré analizarlo con claridad.\n\n"
+            "Lo mejor sería escalarlo a una revisión humana para darte un diagnóstico más preciso."
+        )
+
+
 def respuesta_con_memoria(number, mensaje):
     texto = normalizar_texto(mensaje)
     estado = obtener_estado(number)
+    url_detectada = extraer_url(mensaje)
+
+    if url_detectada:
+        estado["url_web"] = url_detectada
+        estado["lead_caliente"] = True
+        estado["etapa"] = "cerrar"
+        diagnostico = analizar_web(url_detectada)
+        estado["diagnostico_web"] = diagnostico
+        return diagnostico
 
     if texto in ["reiniciar", "reset", "empezar de nuevo", "inicio"]:
         reiniciar_conversacion(number)
@@ -148,7 +279,7 @@ def respuesta_con_memoria(number, mensaje):
             return (
                 "Entonces hay buen punto de partida.\n\n"
                 "Nosotros trabajamos justo eso: estructura, velocidad y claridad para que la web realmente apoye la captación de clientes.\n\n"
-                "Si quieres, puedo revisar tu web o tu idea y darte un diagnóstico claro de qué está funcionando y qué no."
+                "Envíame el link de tu web y te doy un primer diagnóstico automático."
             )
         return (
             "Perfecto. En ese caso no forzaría un proyecto todavía.\n\n"
@@ -160,16 +291,15 @@ def respuesta_con_memoria(number, mensaje):
             estado["lead_caliente"] = True
             estado["etapa"] = "cerrar"
             return (
-                "Perfecto. Envíame el link de tu web o una breve descripción de la idea.\n\n"
-                "La revisión no es una llamada de venta: es para detectar problemas, darte claridad y ver si tiene sentido avanzar."
+                "Perfecto. Envíame el link de tu web.\n\n"
+                "Haré una primera revisión automática de claridad, estructura y llamadas a la acción."
             )
         return "Entendido. ¿Quieres que te explique qué revisamos normalmente en un diagnóstico web?"
 
     if etapa == "cerrar":
         estado["lead_caliente"] = True
         return (
-            "Recibido. Si no puedo revisar algo con claridad, lo escalo a una persona del equipo.\n\n"
-            "Para darte un diagnóstico más útil, dime también: ¿qué tipo de proyectos quiere atraer tu estudio?"
+            "Recibido. Para darte un diagnóstico más útil, dime también: ¿qué tipo de proyectos quiere atraer tu estudio?"
         )
 
     estado["etapa"] = "inicio"
@@ -210,6 +340,8 @@ def construir_payload_lead(number, estado):
         "quiere_oportunidades": estado.get("quiere_oportunidades") or "",
         "problema_detectado": estado.get("problema_detectado") or "",
         "presupuesto": estado.get("presupuesto") or "",
+        "url_web": estado.get("url_web") or "",
+        "diagnostico_web": estado.get("diagnostico_web") or "",
         "etapa": estado.get("etapa") or "",
         "lead_caliente": estado.get("lead_caliente", False),
         "ultimo_mensaje": ultimo_mensaje,
@@ -223,6 +355,7 @@ def construir_resumen_interno(estado):
         f"Contactos: {estado.get('genera_contactos') or 'no especificado'} | "
         f"Valor: {estado.get('comunica_valor') or 'no especificado'} | "
         f"Problema: {estado.get('problema_detectado') or 'no especificado'} | "
+        f"URL: {estado.get('url_web') or 'no especificado'} | "
         f"Etapa: {estado.get('etapa') or 'no especificado'}"
     )
 
@@ -249,7 +382,8 @@ def enviar_alerta_lead_caliente(number, estado):
         f"Situacion web: {estado.get('situacion_web') or 'no especificado'}\n"
         f"Contactos: {estado.get('genera_contactos') or 'no especificado'}\n"
         f"Valor: {estado.get('comunica_valor') or 'no especificado'}\n"
-        f"Problema: {estado.get('problema_detectado') or 'no especificado'}\n\n"
+        f"Problema: {estado.get('problema_detectado') or 'no especificado'}\n"
+        f"Web: {estado.get('url_web') or 'no enviada'}\n\n"
         "Recomendacion: ofrecer diagnóstico estratégico breve."
     )
     enviado = enviar_mensaje(ALERT_PHONE_NUMBER, mensaje)
