@@ -114,9 +114,7 @@ def analizar_web(url):
         if parsed.scheme not in ["http", "https"] or not parsed.netloc:
             return "No pude leer ese enlace. Envíame una URL completa, por ejemplo: https://tusitio.com"
 
-        headers = {
-            "User-Agent": "Mozilla/5.0 (compatible; ArquileadsBot/1.0; +https://example.com/bot)"
-        }
+        headers = {"User-Agent": "Mozilla/5.0 (compatible; ArquileadsBot/1.0; +https://example.com/bot)"}
         response = requests.get(url, headers=headers, timeout=12, allow_redirects=True)
         status = response.status_code
 
@@ -298,9 +296,7 @@ def respuesta_con_memoria(number, mensaje):
 
     if etapa == "cerrar":
         estado["lead_caliente"] = True
-        return (
-            "Recibido. Para darte un diagnóstico más útil, dime también: ¿qué tipo de proyectos quiere atraer tu estudio?"
-        )
+        return "Recibido. Para darte un diagnóstico más útil, dime también: ¿qué tipo de proyectos quiere atraer tu estudio?"
 
     estado["etapa"] = "inicio"
     return "Volvamos al inicio: ¿tu web actual ya está funcionando o estás empezando desde cero?"
@@ -412,6 +408,29 @@ def home():
 @app.route("/memoria", methods=["GET"])
 def ver_memoria():
     return CONVERSACIONES, 200
+
+
+@app.route("/test", methods=["GET"])
+def test():
+    msg = request.args.get("msg", "")
+    number = request.args.get("number", "test_user")
+
+    if not msg:
+        return {
+            "error": "Agrega un mensaje con ?msg=tu_mensaje",
+            "ejemplo": "/test?msg=hola&number=cliente1"
+        }, 400
+
+    guardar_mensaje(number, "user", msg)
+    respuesta = respuesta_con_memoria(number, msg)
+    guardar_mensaje(number, "assistant", respuesta)
+    procesar_crm_y_alertas(number, msg)
+
+    return {
+        "mensaje": msg,
+        "respuesta": respuesta,
+        "estado": CONVERSACIONES.get(number)
+    }, 200
 
 
 @app.route("/webhook", methods=["GET", "POST"])
