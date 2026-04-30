@@ -10,10 +10,24 @@ PHONE_NUMBER_ID = os.environ.get("PHONE_NUMBER_ID")
 VERIFY_TOKEN = os.environ.get("VERIFY_TOKEN")
 GRAPH_API_VERSION = os.environ.get("GRAPH_API_VERSION", "v25.0")
 
+# Opcionales para CRM y alertas
+SHEETS_WEBHOOK_URL = os.environ.get("SHEETS_WEBHOOK_URL")
+ALERT_PHONE_NUMBER = os.environ.get("ALERT_PHONE_NUMBER")
+
 # Memoria temporal por numero de WhatsApp.
 # Importante: en Render esta memoria se puede perder si el servicio reinicia.
-# Para produccion conviene mover esto a una base de datos o Google Sheets.
+# Google Sheets funcionara como registro externo de leads.
 CONVERSACIONES = {}
+
+PALABRAS_LEAD_CALIENTE = [
+    "quiero", "me interesa", "agendar", "llamada", "cotizar", "cotizacion", "cotización",
+    "precio", "costo", "cuanto", "cuánto", "hoy", "esta semana", "urgente", "contratar",
+    "empezar", "pagar", "presupuesto"
+]
+
+
+def ahora_iso():
+    return datetime.utcnow().isoformat()
 
 
 def normalizar_texto(texto):
@@ -23,15 +37,19 @@ def normalizar_texto(texto):
 def obtener_estado(number):
     if number not in CONVERSACIONES:
         CONVERSACIONES[number] = {
+            "telefono": number,
             "etapa": "inicio",
             "servicio": None,
             "negocio": None,
             "web_actual": None,
             "presupuesto": None,
             "urgencia": None,
+            "lead_caliente": False,
+            "alerta_enviada": False,
+            "guardado_en_sheets": False,
             "mensajes": [],
-            "creado_en": datetime.utcnow().isoformat(),
-            "actualizado_en": datetime.utcnow().isoformat(),
+            "creado_en": ahora_iso(),
+            "actualizado_en": ahora_iso(),
         }
     return CONVERSACIONES[number]
 
@@ -41,25 +59,27 @@ def guardar_mensaje(number, role, text):
     estado["mensajes"].append({
         "role": role,
         "text": text,
-        "timestamp": datetime.utcnow().isoformat(),
+        "timestamp": ahora_iso(),
     })
-    estado["actualizado_en"] = datetime.utcnow().isoformat()
-
-    # Evita que la memoria crezca demasiado en esta version simple.
+    estado["actualizado_en"] = ahora_iso()
     estado["mensajes"] = estado["mensajes"][-20:]
 
 
 def reiniciar_conversacion(number):
     CONVERSACIONES[number] = {
+        "telefono": number,
         "etapa": "inicio",
         "servicio": None,
         "negocio": None,
         "web_actual": None,
         "presupuesto": None,
         "urgencia": None,
+        "lead_caliente": False,
+        "alerta_enviada": False,
+        "guardado_en_sheets": False,
         "mensajes": [],
-        "creado_en": datetime.utcnow().isoformat(),
-        "actualizado_en": datetime.utcnow().isoformat(),
+        "creado_en": ahora_iso(),
+        "actualizado_en": ahora_iso(),
     }
     return CONVERSACIONES[number]
 
@@ -78,6 +98,102 @@ def detectar_servicio(texto):
     if texto in ["3", "tres"]:
         return "captación de leads"
     return None
+
+
+def es_lead_caliente(texto, estado):
+    texto = normalizar_texto(texto)
+    tiene_palabra_caliente = any(p in texto for p in PALABRAS_LEAD_CALIENTE)
+    etapa_avanzada = estado.get("etapa") in ["preguntar_urgencia", "cerrar"]
+    urgencia = normalizar_texto(estado.get("urgencia") or "")
+    urgencia_alta = any(p in urgencia for p in ["1", "esta semana", "hoy", "urgente", "ya"])
+    return tiene_palabra_caliente or etapa_avanzada or urgencia_alta
+
+
+def construir_payload_lead(number, estado):
+    ultimo_mensaje = ""
+    if estado.get("mensajes"):
+        ultimo_mensaje = estado["mensajes"][-1].get("text", "")
+
+    return {
+        "fecha": ahora_iso(),
+        "telefono": number,
+        "servicio": estado.get("servicio") or "",
+        "negocio": estado.get("negocio") or "",
+        "web_actual": estado.get("web_actual") or "",
+        "presupuesto": estado.get("presupuesto") or "",
+        "urgencia": estado.get("urgencia") or "",
+        "etapa": estado.get("etapa") or "",
+        "lead_caliente": estado.get("lead_caliente", False),
+        "ultimo_mensaje": ultimo_mensaje,
+        "resumen": construir_resumen_interno(estado),
+    }
+
+
+def construir_resumen_interno(estado):
+    return (
+        f"Servicio: {estado.get('servicio') or 'no especificado'} | "
+        f"Negocio: {estado.get('negocio') or 'no especificado'} | "
+        f"Web: {estado.get('web_actual') or 'no especificado'} | "
+        f"Presupuesto: {estado.get('presupuesto') or 'no especificado'} | "
+        f"Urgencia: {estado.get('urgencia') or 'no especificado'} | "
+        f"Etapa: {estado.get('etapa') or 'no especificado'}"
+    )
+
+
+def guardar_lead_en_sheets(number, estado):
+    if not SHEETS_WEBHOOK_URL:
+        print("SHEETS_WEBHOOK_URL no configurado. Lead no enviado a Sheets.")
+        return False
+
+    payload = construir_payload_lead(number, estado)
+
+    try:
+        response = requests.post(SHEETS_WEBHOOK_URL, json=payload, timeout=15)
+        print(f"Respuesta de Google Sheets webhook: {response.status_code} - {response.text}")
+        return response.status_code in [200, 201, 202]
+    except requests.RequestException as e:
+        print(f"Error enviando lead a Google Sheets: {e}")
+        return False
+
+
+def enviar_alerta_lead_caliente(number, estado):
+    if not ALERT_PHONE_NUMBER:
+        print("ALERT_PHONE_NUMBER no configurado. Alerta no enviada.")
+        return False
+
+    if estado.get("alerta_enviada"):
+        return False
+
+    mensaje = (
+        "🔥 LEAD CALIENTE ARQUILEADS\n\n"
+        f"Telefono: {number}\n"
+        f"Servicio: {estado.get('servicio') or 'no especificado'}\n"
+        f"Negocio: {estado.get('negocio') or 'no especificado'}\n"
+        f"Web: {estado.get('web_actual') or 'no especificado'}\n"
+        f"Presupuesto: {estado.get('presupuesto') or 'no especificado'}\n"
+        f"Urgencia: {estado.get('urgencia') or 'no especificado'}\n\n"
+        "Recomendacion: responder manualmente lo antes posible."
+    )
+
+    enviado = enviar_mensaje(ALERT_PHONE_NUMBER, mensaje)
+    if enviado:
+        estado["alerta_enviada"] = True
+    return enviado
+
+
+def procesar_crm_y_alertas(number, mensaje):
+    estado = obtener_estado(number)
+
+    if es_lead_caliente(mensaje, estado):
+        estado["lead_caliente"] = True
+        enviar_alerta_lead_caliente(number, estado)
+
+    # Guarda en Sheets cuando el lead ya tiene datos suficientes o se vuelve caliente.
+    datos_suficientes = estado.get("servicio") and estado.get("negocio")
+    if estado.get("lead_caliente") or datos_suficientes or estado.get("etapa") == "cerrar":
+        guardado = guardar_lead_en_sheets(number, estado)
+        if guardado:
+            estado["guardado_en_sheets"] = True
 
 
 def respuesta_con_memoria(number, mensaje):
@@ -149,6 +265,7 @@ def respuesta_con_memoria(number, mensaje):
 
     if etapa == "cerrar":
         if any(p in texto for p in ["si", "sí", "ok", "dale", "llamada", "agendar", "agenda", "quiero"]):
+            estado["lead_caliente"] = True
             return (
                 "Perfecto. Para agendar o avanzar, envíame estos datos:\n\n"
                 "1. Tu nombre\n"
@@ -158,6 +275,7 @@ def respuesta_con_memoria(number, mensaje):
             )
 
         if any(p in texto for p in ["precio", "costo", "cuanto", "cuánto"]):
+            estado["lead_caliente"] = True
             return construir_cierre(estado)
 
         return (
@@ -195,13 +313,11 @@ def construir_cierre(estado):
 
 @app.route("/", methods=["GET"])
 def home():
-    return "Arquileads WhatsApp closer con memoria activo", 200
+    return "Arquileads WhatsApp closer con CRM y alertas activo", 200
 
 
 @app.route("/memoria", methods=["GET"])
 def ver_memoria():
-    # Endpoint simple para revisar memoria desde el navegador/logs.
-    # No usar con datos sensibles en produccion sin autenticacion.
     return CONVERSACIONES, 200
 
 
@@ -246,6 +362,7 @@ def webhook():
                     guardar_mensaje(number, "assistant", respuesta)
                     enviar_mensaje(number, respuesta)
 
+                    procesar_crm_y_alertas(number, message_body)
                     print(f"Estado actualizado para {number}: {CONVERSACIONES.get(number)}")
 
     except Exception as e:
@@ -257,7 +374,7 @@ def webhook():
 def enviar_mensaje(number, text):
     if not ACCESS_TOKEN or not PHONE_NUMBER_ID:
         print("Faltan ACCESS_TOKEN o PHONE_NUMBER_ID en variables de entorno")
-        return
+        return False
 
     url = f"https://graph.facebook.com/{GRAPH_API_VERSION}/{PHONE_NUMBER_ID}/messages"
 
@@ -276,8 +393,10 @@ def enviar_mensaje(number, text):
     try:
         response = requests.post(url, json=payload, headers=headers, timeout=15)
         print(f"Respuesta de Meta: {response.status_code} - {response.text}")
+        return 200 <= response.status_code < 300
     except requests.RequestException as e:
         print(f"Error enviando mensaje a Meta: {e}")
+        return False
 
 
 if __name__ == "__main__":
